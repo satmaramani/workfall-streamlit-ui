@@ -11,13 +11,61 @@ from config import (
     MARKET_INTELLIGENCE_BASE_URL,
     TRULENS_PORT,
 )
-from http_client import get_json, post_json
+from http_client import delete_json, get_json, post_json
 from inventory_helpers import load_inventory_products, product_option_labels, product_option_map
 
 
-inventory_products, inventory_error = load_inventory_products()
+def refresh_inventory_state() -> None:
+    products, error = load_inventory_products()
+    st.session_state["inventory_products"] = products
+    st.session_state["inventory_error"] = error
+
+
+def sync_inventory_selection_keys() -> None:
+    products = st.session_state.get("inventory_products", [])
+    product_ids = [item["product_id"] for item in products]
+    if not product_ids:
+        for key in ("inventory-delete-product", "invoice-product", "market-product"):
+            st.session_state.pop(key, None)
+        return
+
+    for key in ("inventory-delete-product", "invoice-product", "market-product"):
+        if st.session_state.get(key) not in product_ids:
+            st.session_state[key] = product_ids[0]
+
+
+if "inventory_products" not in st.session_state or "inventory_error" not in st.session_state:
+    refresh_inventory_state()
+sync_inventory_selection_keys()
+
+inventory_products = st.session_state["inventory_products"]
+inventory_error = st.session_state["inventory_error"]
 inventory_options = product_option_labels(inventory_products)
 inventory_option_map = product_option_map(inventory_products)
+
+
+def render_inventory_table(products_payload: dict) -> None:
+    products = products_payload.get("products", [])
+    if not products:
+        st.info("No inventory products found.")
+        return
+
+    st.markdown("**Inventory Catalog**")
+    st.table(
+        [
+            {
+                "Product ID": item.get("product_id"),
+                "Product Name": item.get("product_name"),
+                "Category": item.get("category"),
+                "Available Quantity": item.get("quantity"),
+                "Unit Price": item.get("unit_price"),
+            }
+            for item in products
+        ]
+    )
+
+    with st.expander("Show raw inventory JSON"):
+        st.json(products_payload)
 
 
 def render_compact_invoice_result(result: dict) -> None:
@@ -46,6 +94,12 @@ def render_compact_invoice_result(result: dict) -> None:
         )
 
     market_summaries = result.get("market_summaries", [])
+    market_status = result.get("market_insight_status", "unknown")
+    if market_status != "skipped":
+        st.caption(
+            f"Final invoice pricing may differ from the inventory base price because market pricing was "
+            f"`{market_status}`."
+        )
     if market_summaries:
         summary = market_summaries[0]
         st.markdown("**Market Pricing Summary**")
@@ -120,7 +174,8 @@ tab_concierge, tab_inventory, tab_invoice, tab_market, tab_trace, tab_health = s
 with tab_concierge:
     st.subheader("Concierge Request")
     user_input = st.text_area("Ask the system", value="Generate invoice for 2 laptop units", height=120)
-    session_id = st.text_input("Session ID (optional)")
+    default_session_id = st.session_state.get("last_session_id", "")
+    session_id = st.text_input("Session ID (optional)", value=default_session_id, key="concierge-session-id")
     include_market = st.toggle("Include market insights", value=True)
     if st.button("Send To Concierge", type="primary"):
         with st.spinner("Running concierge workflow across agents..."):
@@ -137,6 +192,7 @@ with tab_concierge:
             session = result["data"].get("session_id")
             if session:
                 st.session_state["last_session_id"] = session
+                st.session_state["concierge-session-id"] = session
             render_compact_concierge_result(result["data"])
         else:
             st.error(result["error"])
@@ -147,16 +203,16 @@ with tab_inventory:
     with col1:
         if st.button("Refresh Products"):
             with st.spinner("Refreshing inventory from Inventory Agent..."):
-                result = get_json(f"{INVENTORY_BASE_URL}/api/v1/products", timeout=20.0)
-            if result["ok"]:
-                st.json(result["data"])
-            else:
-                st.error(result["error"])
+                refresh_inventory_state()
+            st.rerun()
     with col2:
         if inventory_error:
             st.warning(f"Could not load live inventory: {inventory_error}")
         else:
             st.markdown(f"Loaded `{len(inventory_products)}` live products from Inventory Agent.")
+
+    if not inventory_error and inventory_products:
+        render_inventory_table({"products": inventory_products})
 
     with st.form("inventory-upsert-form"):
         product_id = st.text_input("Product ID", value="demo-product")
@@ -164,6 +220,11 @@ with tab_inventory:
         quantity = st.number_input("Quantity", min_value=0, value=10)
         unit_price = st.number_input("Unit Price", min_value=0.0, value=99.0)
         category = st.text_input("Category", value="general")
+        merge_quantity = st.toggle(
+            "If this product ID already exists, add this quantity to existing stock instead of replacing it",
+            value=True,
+            key="inventory-merge-quantity",
+        )
         if st.form_submit_button("Save Product"):
             with st.spinner("Saving product in Inventory Agent..."):
                 result = post_json(
@@ -174,13 +235,63 @@ with tab_inventory:
                         "quantity": int(quantity),
                         "unit_price": float(unit_price),
                         "category": category,
+                        "merge_quantity": merge_quantity,
                     },
                     timeout=30.0,
                 )
             if result["ok"]:
-                st.json(result["data"])
+                refresh_inventory_state()
+                st.success(f"Saved product `{product_id}` successfully.")
+                st.rerun()
             else:
                 st.error(result["error"])
+
+    st.markdown("**Delete Product**")
+    if inventory_error:
+        st.warning("Delete actions need live inventory data.")
+    elif not inventory_products:
+        st.info("No products available to delete.")
+    else:
+        delete_product_id = st.selectbox(
+            "Product to Delete",
+            [item["product_id"] for item in inventory_products],
+            key="inventory-delete-product",
+            format_func=lambda product_id: inventory_option_map.get(product_id, product_id),
+        )
+        delete_product = next(
+            item for item in inventory_products if item["product_id"] == delete_product_id
+        )
+        if delete_product["quantity"] > 0:
+            st.warning(
+                f"This product still has {delete_product['quantity']} units in stock. "
+                "Deleting it will permanently remove an in-stock product."
+            )
+        else:
+            st.caption("This product has zero stock and is ready for deletion.")
+
+        confirm_delete = st.checkbox(
+            "I understand this deletion is permanent and may affect downstream workflows.",
+            key="inventory-delete-confirm",
+        )
+        if st.button("Delete Product", type="secondary", key="inventory-delete-button"):
+            if not confirm_delete:
+                st.warning("Please confirm the deletion before continuing.")
+            else:
+                with st.spinner("Deleting product from Inventory Agent..."):
+                    result = delete_json(
+                        f"{INVENTORY_BASE_URL}/api/v1/products/{delete_product_id}",
+                        timeout=30.0,
+                    )
+                if result["ok"]:
+                    refresh_inventory_state()
+                    if st.session_state.get("inventory-delete-product") == delete_product_id:
+                        remaining_products = [item["product_id"] for item in st.session_state["inventory_products"]]
+                        if remaining_products:
+                            st.session_state["inventory-delete-product"] = remaining_products[0]
+                    st.success(f"Deleted product `{delete_product_id}` successfully.")
+                    st.rerun()
+                else:
+                    st.error(result["error"])
 
 with tab_invoice:
     st.subheader("Invoice Preview")
@@ -194,6 +305,7 @@ with tab_invoice:
             selected_product_id = st.selectbox(
                 "Product",
                 product_ids,
+                key="invoice-product",
                 format_func=lambda product_id: inventory_option_map.get(product_id, product_id),
             )
             selected_product = next(
@@ -202,6 +314,10 @@ with tab_invoice:
             quantity = st.number_input("Quantity", min_value=1, value=1)
             customer_name = st.text_input("Customer Name", value="Internal Demo Customer")
             include_market = st.toggle("Use market insight for pricing", value=True, key="invoice-market")
+            st.caption(
+                f"Base inventory price for this product: {selected_product['unit_price']}. "
+                "If market pricing is enabled, the final invoice unit price may increase or decrease."
+            )
             if st.form_submit_button("Generate Invoice"):
                 with st.spinner("Generating invoice and waiting for downstream agent responses..."):
                     result = post_json(
@@ -209,6 +325,7 @@ with tab_invoice:
                         {
                             "customer_name": customer_name,
                             "include_market_insights": include_market,
+                            "session_id": st.session_state.get("last_session_id"),
                             "items": [{"product_id": selected_product["product_id"], "quantity": int(quantity)}],
                         },
                         timeout=180.0,
