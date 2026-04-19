@@ -37,11 +37,25 @@ def sync_inventory_selection_keys() -> None:
 if "inventory_products" not in st.session_state or "inventory_error" not in st.session_state:
     refresh_inventory_state()
 sync_inventory_selection_keys()
+st.session_state.setdefault("last_invoice_result", None)
 
 inventory_products = st.session_state["inventory_products"]
 inventory_error = st.session_state["inventory_error"]
 inventory_options = product_option_labels(inventory_products)
 inventory_option_map = product_option_map(inventory_products)
+
+
+def render_key_value_table(data: dict, *, title: str | None = None) -> None:
+    scalar_rows = []
+    for key, value in data.items():
+        if isinstance(value, (dict, list)):
+            continue
+        scalar_rows.append({"Field": key.replace("_", " ").title(), "Value": value})
+    if not scalar_rows:
+        return
+    if title:
+        st.markdown(f"**{title}**")
+    st.table(scalar_rows)
 
 
 def render_inventory_table(products_payload: dict) -> None:
@@ -110,6 +124,11 @@ def render_compact_invoice_result(result: dict) -> None:
             f" | Citations: {len(summary.get('citations', []))}"
         )
 
+    workflow_steps = result.get("workflow_steps", [])
+    if workflow_steps:
+        st.markdown("**Downstream Workflow Steps**")
+        st.table(workflow_steps)
+
     with st.expander("Show full invoice JSON"):
         st.json(result)
 
@@ -136,7 +155,9 @@ def render_compact_concierge_result(result: dict) -> None:
         render_compact_invoice_result(data)
     elif data:
         st.markdown("**Result Summary**")
-        st.json(data)
+        render_key_value_table(data)
+        with st.expander("Show full result JSON"):
+            st.json(data)
 
     with st.expander("Show full workflow JSON"):
         st.json(result)
@@ -154,14 +175,96 @@ def render_compact_market_result(result: dict) -> None:
     st.markdown("**Summary**")
     st.write(result.get("summary", ""))
 
+    competitor_prices = result.get("competitor_prices", [])
+    if competitor_prices:
+        st.markdown("**Competitor Pricing**")
+        st.table(
+            [
+                {
+                    "Seller": item.get("seller"),
+                    "Price": item.get("price"),
+                    "Note": item.get("note"),
+                }
+                for item in competitor_prices
+            ]
+        )
+
     citations = result.get("citations", [])
     if citations:
         st.markdown("**Top Citations**")
         for citation in citations[:5]:
             st.markdown(f"- [{citation.get('title') or citation.get('url')}]({citation.get('url')})")
 
+    history = result.get("internal_research_context", {}).get("recent_analyses", [])
+    if history:
+        st.markdown("**Recent Internal Research**")
+        st.table(
+            [
+                {
+                    "Created At": item.get("created_at"),
+                    "Recommended Price": item.get("recommended_price"),
+                    "Trend": item.get("trend"),
+                }
+                for item in history
+            ]
+        )
+
     with st.expander("Show full market JSON"):
         st.json(result)
+
+
+def render_trace_result(result: dict) -> None:
+    events = result.get("events", [])
+    st.markdown("**Trace Summary**")
+    top = st.columns(2)
+    top[0].metric("Session", result.get("session_id", "-"))
+    top[1].metric("Events", len(events))
+
+    if not events:
+        st.info("No workflow trace events found for this session.")
+    else:
+        st.table(
+            [
+                {
+                    "When": event.get("created_at"),
+                    "Service": event.get("service_name"),
+                    "Step": event.get("step_name"),
+                    "Type": event.get("step_type"),
+                    "Status": event.get("status"),
+                    "Model": event.get("model_name"),
+                }
+                for event in events
+            ]
+        )
+
+    with st.expander("Show full trace JSON"):
+        st.json(result)
+
+
+def render_health_report(health_report: dict) -> None:
+    services = health_report.get("services", {})
+    st.markdown("**Service Status**")
+    if not services:
+        st.info("No health data available.")
+        return
+
+    st.table(
+        [
+            {
+                "Service": name,
+                "Status": payload.get("status", "error"),
+                "Port": payload.get("port", "-"),
+                "DB Available": payload.get("db_available", "-"),
+                "OpenAI": payload.get("openai_configured", "-"),
+                "Details": payload.get("detail", ""),
+            }
+            for name, payload in services.items()
+        ]
+    )
+
+    st.caption(f"TruLens dashboard URL: {health_report.get('trulens_dashboard_url', '-')}")
+    with st.expander("Show full health JSON"):
+        st.json(health_report)
 
 st.set_page_config(page_title="Workfall Multi-Agent Commerce", layout="wide")
 st.title("Workfall Multi-Agent E-Commerce")
@@ -331,9 +434,16 @@ with tab_invoice:
                         timeout=180.0,
                     )
                 if result["ok"]:
-                    render_compact_invoice_result(result["data"])
+                    st.session_state["last_invoice_result"] = result["data"]
+                    refresh_inventory_state()
+                    sync_inventory_selection_keys()
+                    st.rerun()
                 else:
+                    st.session_state["last_invoice_result"] = None
                     st.error(result["error"])
+
+        if st.session_state.get("last_invoice_result"):
+            render_compact_invoice_result(st.session_state["last_invoice_result"])
 
 with tab_market:
     st.subheader("Market Intelligence")
@@ -374,7 +484,7 @@ with tab_trace:
             with st.spinner("Loading workflow trace..."):
                 result = get_json(f"{CONCIERGE_BASE_URL}/api/v1/traces/{trace_session_id}", timeout=20.0)
             if result["ok"]:
-                st.json(result["data"])
+                render_trace_result(result["data"])
             else:
                 st.error(result["error"])
 
@@ -392,4 +502,4 @@ with tab_health:
             for name, url in services.items():
                 result = get_json(url, timeout=10.0)
                 health_report[name] = result["data"] if result["ok"] else {"status": "error", "detail": result["error"]}
-        st.json({"services": health_report, "trulens_dashboard_url": f"http://localhost:{TRULENS_PORT}"})
+        render_health_report({"services": health_report, "trulens_dashboard_url": f"http://localhost:{TRULENS_PORT}"})
