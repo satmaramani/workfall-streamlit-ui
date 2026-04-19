@@ -34,10 +34,32 @@ def sync_inventory_selection_keys() -> None:
             st.session_state[key] = product_ids[0]
 
 
+def clear_market_result_if_matches(product_id: str) -> None:
+    last_market_result = st.session_state.get("last_market_result")
+    if isinstance(last_market_result, dict) and last_market_result.get("product_id") == product_id:
+        st.session_state["last_market_result"] = None
+
+
+def refresh_market_cache_snapshot(limit: int = 200) -> None:
+    result = get_json(f"{MARKET_INTELLIGENCE_BASE_URL}/api/v1/cache/market?limit={limit}", timeout=30.0)
+    st.session_state["market_cache_snapshot"] = result["data"] if result["ok"] else None
+    st.session_state["market_cache_error"] = None if result["ok"] else result["error"]
+
+
 if "inventory_products" not in st.session_state or "inventory_error" not in st.session_state:
     refresh_inventory_state()
 sync_inventory_selection_keys()
 st.session_state.setdefault("last_invoice_result", None)
+st.session_state.setdefault("last_concierge_result", None)
+st.session_state.setdefault("last_market_result", None)
+st.session_state.setdefault("market_cache_snapshot", None)
+st.session_state.setdefault("market_cache_error", None)
+
+pending_concierge_session = st.session_state.pop("pending_concierge_session_id", None)
+if pending_concierge_session:
+    st.session_state["last_session_id"] = pending_concierge_session
+    st.session_state["concierge-session-id"] = pending_concierge_session
+    st.session_state["trace-session-id"] = pending_concierge_session
 
 inventory_products = st.session_state["inventory_products"]
 inventory_error = st.session_state["inventory_error"]
@@ -165,9 +187,31 @@ def render_compact_concierge_result(result: dict) -> None:
 
 def render_compact_market_result(result: dict) -> None:
     st.success(f"Market analysis ready for {result.get('product_name', 'product')}")
-    top = st.columns(2)
+    cache = result.get("cache", {})
+    top = st.columns(4)
     top[0].metric("Current Price", result.get("current_unit_price", "-"))
     top[1].metric("Recommended", result.get("recommended_price", "-"))
+    top[2].metric("Cache Source", str(cache.get("source", "unknown")).replace("_", " ").title())
+    cache_age = cache.get("cache_age_minutes")
+    top[3].metric("Cache Age (min)", "-" if cache_age is None else cache_age)
+
+    if cache:
+        freshness_label = "stale" if cache.get("is_stale") else "fresh"
+        st.caption(
+            f"Cache enabled: `{cache.get('enabled')}`"
+            f" | TTL: `{cache.get('ttl_minutes')}` minutes"
+            f" | Freshness: `{freshness_label}`"
+            f" | Cached at: `{cache.get('cached_at') or 'n/a'}`"
+            f" | Expires at: `{cache.get('cache_expires_at') or 'n/a'}`"
+            f" | Force refresh: `{cache.get('force_refresh')}`"
+        )
+        if cache.get("source") == "live_analysis":
+            st.info("This result was generated live using current product context and then saved into cache.")
+        elif cache.get("source") == "cache_hit":
+            st.info("This result came from the saved market cache, so no fresh OpenAI call was needed.")
+        elif cache.get("source") == "stale_cache_fallback":
+            st.warning("Live market research failed, so the system served the most recent stale cached result.")
+
     st.markdown("**Trend**")
     st.write(result.get("trend", "-"))
     st.markdown("**Demand**")
@@ -211,6 +255,38 @@ def render_compact_market_result(result: dict) -> None:
 
     with st.expander("Show full market JSON"):
         st.json(result)
+
+
+def render_market_cache_snapshot(snapshot: dict) -> None:
+    st.markdown("**Market Cache Overview**")
+    top = st.columns(4)
+    top[0].metric("Cache Enabled", snapshot.get("cache_enabled", "-"))
+    top[1].metric("TTL (min)", snapshot.get("cache_ttl_minutes", "-"))
+    top[2].metric("Entries", snapshot.get("entry_count", 0))
+    top[3].metric("Stale Fallback", snapshot.get("allow_stale_fallback", "-"))
+
+    entries = snapshot.get("entries", [])
+    if not entries:
+        st.info("No market cache entries found yet.")
+        return
+
+    st.table(
+        [
+            {
+                "Product ID": entry.get("product_id"),
+                "Product Name": entry.get("product_name"),
+                "Recommended Price": entry.get("recommended_price"),
+                "Cached At": entry.get("created_at"),
+                "Age (min)": entry.get("cache_age_minutes"),
+                "Expires At": entry.get("cache_expires_at"),
+                "Stale": entry.get("is_stale"),
+            }
+            for entry in entries
+        ]
+    )
+
+    with st.expander("Show full cache JSON"):
+        st.json(snapshot)
 
 
 def render_trace_result(result: dict) -> None:
@@ -270,15 +346,15 @@ st.set_page_config(page_title="Workfall Multi-Agent Commerce", layout="wide")
 st.title("Workfall Multi-Agent E-Commerce")
 st.caption("Concierge orchestration, inventory, invoice, market intelligence, and observability-ready UI.")
 
-tab_concierge, tab_inventory, tab_invoice, tab_market, tab_trace, tab_health = st.tabs(
-    ["Concierge", "Inventory", "Invoice", "Market", "Trace", "Health"]
+tab_concierge, tab_inventory, tab_invoice, tab_market, tab_settings, tab_trace, tab_health = st.tabs(
+    ["Concierge", "Inventory", "Invoice", "Market", "Settings", "Trace", "Health"]
 )
 
 with tab_concierge:
     st.subheader("Concierge Request")
     user_input = st.text_area("Ask the system", value="Generate invoice for 2 laptop units", height=120)
-    default_session_id = st.session_state.get("last_session_id", "")
-    session_id = st.text_input("Session ID (optional)", value=default_session_id, key="concierge-session-id")
+    st.session_state.setdefault("concierge-session-id", st.session_state.get("last_session_id", ""))
+    session_id = st.text_input("Session ID (optional)", key="concierge-session-id")
     include_market = st.toggle("Include market insights", value=True)
     if st.button("Send To Concierge", type="primary"):
         with st.spinner("Running concierge workflow across agents..."):
@@ -292,13 +368,22 @@ with tab_concierge:
                 timeout=180.0,
             )
         if result["ok"]:
+            st.session_state["last_concierge_result"] = result["data"]
             session = result["data"].get("session_id")
             if session:
                 st.session_state["last_session_id"] = session
-                st.session_state["concierge-session-id"] = session
-            render_compact_concierge_result(result["data"])
+                st.session_state["pending_concierge_session_id"] = session
+                st.rerun()
+            else:
+                render_compact_concierge_result(result["data"])
         else:
+            st.session_state["last_concierge_result"] = None
             st.error(result["error"])
+
+    if st.session_state.get("last_session_id") and not st.session_state.get("pending_concierge_session_id"):
+        last_result = st.session_state.get("last_concierge_result")
+        if last_result:
+            render_compact_concierge_result(last_result)
 
 with tab_inventory:
     st.subheader("Inventory Operations")
@@ -462,21 +547,96 @@ with tab_market:
         selected_product = next(
             item for item in inventory_products if item["product_id"] == selected_product_id
         )
+        force_refresh_market = st.toggle(
+            "Force fresh market research (bypass cache for this request)",
+            value=False,
+            key="market-force-refresh",
+        )
+        st.caption(
+            "New products go live on the first request because no cache exists yet. "
+            "Later requests can reuse the saved cache until the TTL expires."
+        )
         if st.button("Fetch Market Insight"):
             with st.spinner("Researching market signals and competitor pricing..."):
                 result = get_json(
-                    f"{MARKET_INTELLIGENCE_BASE_URL}/api/v1/insights/{selected_product['product_id']}",
+                    f"{MARKET_INTELLIGENCE_BASE_URL}/api/v1/insights/{selected_product['product_id']}"
+                    f"?force_refresh={'true' if force_refresh_market else 'false'}",
                     timeout=180.0,
                 )
             if result["ok"]:
-                render_compact_market_result(result["data"])
+                st.session_state["last_market_result"] = result["data"]
+                refresh_market_cache_snapshot()
+            else:
+                st.session_state["last_market_result"] = None
+                st.error(result["error"])
+
+        if st.session_state.get("last_market_result"):
+            render_compact_market_result(st.session_state["last_market_result"])
+
+with tab_settings:
+    st.subheader("Settings & Cache Admin")
+    st.markdown("**Market Cache Controls**")
+    st.caption(
+        "Use this tab to inspect cache freshness, clear one product cache for live demoing, "
+        "or reset the full saved market cache."
+    )
+    control_col1, control_col2 = st.columns(2)
+    with control_col1:
+        if st.button("Load Market Cache Snapshot"):
+            with st.spinner("Loading market cache metadata..."):
+                refresh_market_cache_snapshot()
+    with control_col2:
+        if st.button("Refresh Inventory Context for Admin"):
+            with st.spinner("Refreshing live inventory data..."):
+                refresh_inventory_state()
+            sync_inventory_selection_keys()
+            st.rerun()
+
+    if st.session_state.get("market_cache_error"):
+        st.error(st.session_state["market_cache_error"])
+    elif st.session_state.get("market_cache_snapshot"):
+        render_market_cache_snapshot(st.session_state["market_cache_snapshot"])
+
+    st.markdown("**Flush Market Cache**")
+    if inventory_products:
+        admin_product_id = st.selectbox(
+            "Product Cache to Clear",
+            [item["product_id"] for item in inventory_products],
+            key="settings-market-cache-product",
+            format_func=lambda product_id: inventory_option_map.get(product_id, product_id),
+        )
+        if st.button("Clear Selected Product Cache", type="secondary"):
+            with st.spinner("Clearing selected product cache..."):
+                result = delete_json(
+                    f"{MARKET_INTELLIGENCE_BASE_URL}/api/v1/cache/market/{admin_product_id}",
+                    timeout=30.0,
+                )
+            if result["ok"]:
+                clear_market_result_if_matches(admin_product_id)
+                refresh_market_cache_snapshot()
+                st.success(
+                    f"Cleared market cache for `{admin_product_id}`. "
+                    "The next market lookup for this product will go live first."
+                )
             else:
                 st.error(result["error"])
+    else:
+        st.info("Load inventory products first to enable per-product cache clearing.")
+
+    if st.button("Clear All Market Cache"):
+        with st.spinner("Clearing all saved market cache entries..."):
+            result = delete_json(f"{MARKET_INTELLIGENCE_BASE_URL}/api/v1/cache/market", timeout=30.0)
+        if result["ok"]:
+            st.session_state["last_market_result"] = None
+            refresh_market_cache_snapshot()
+            st.success("Cleared the full market cache. All next market lookups will go live first.")
+        else:
+            st.error(result["error"])
 
 with tab_trace:
     st.subheader("Workflow Trace")
-    default_session = st.session_state.get("last_session_id", "")
-    trace_session_id = st.text_input("Session ID for trace lookup", value=default_session, key="trace-session-id")
+    st.session_state.setdefault("trace-session-id", st.session_state.get("last_session_id", ""))
+    trace_session_id = st.text_input("Session ID for trace lookup", key="trace-session-id")
     if st.button("Load Trace"):
         if not trace_session_id:
             st.warning("Run a Concierge request first or enter a session ID.")

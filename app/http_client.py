@@ -4,6 +4,15 @@ from typing import Any
 
 import httpx
 
+from config import API_SHARED_TOKEN
+
+
+def _request_headers() -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if API_SHARED_TOKEN:
+        headers["X-API-Token"] = API_SHARED_TOKEN
+    return headers
+
 
 def _extract_error(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
@@ -22,7 +31,7 @@ def _extract_error(exc: Exception) -> str:
 
 def post_json(url: str, payload: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
     try:
-        response = httpx.post(url, json=payload, timeout=timeout)
+        response = httpx.post(url, json=payload, timeout=timeout, headers=_request_headers())
         response.raise_for_status()
         return {"ok": True, "data": response.json()}
     except Exception as exc:  # pragma: no cover
@@ -31,7 +40,7 @@ def post_json(url: str, payload: dict[str, Any], timeout: float = 15.0) -> dict[
 
 def get_json(url: str, timeout: float = 10.0) -> dict[str, Any]:
     try:
-        response = httpx.get(url, timeout=timeout)
+        response = httpx.get(url, timeout=timeout, headers=_request_headers())
         response.raise_for_status()
         return {"ok": True, "data": response.json()}
     except Exception as exc:  # pragma: no cover
@@ -40,7 +49,7 @@ def get_json(url: str, timeout: float = 10.0) -> dict[str, Any]:
 
 def delete_json(url: str, timeout: float = 15.0) -> dict[str, Any]:
     try:
-        response = httpx.delete(url, timeout=timeout)
+        response = httpx.delete(url, timeout=timeout, headers=_request_headers())
         response.raise_for_status()
         return {"ok": True, "data": response.json()}
     except Exception as exc:  # pragma: no cover
