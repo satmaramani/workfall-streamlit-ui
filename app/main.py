@@ -16,12 +16,14 @@ from inventory_helpers import load_inventory_products, product_option_labels, pr
 
 
 def refresh_inventory_state() -> None:
+    # Inventory is the source of truth for most dropdowns, so one refresh updates several tabs at once.
     products, error = load_inventory_products()
     st.session_state["inventory_products"] = products
     st.session_state["inventory_error"] = error
 
 
 def sync_inventory_selection_keys() -> None:
+    # When products change, this keeps stale widget selections from pointing at deleted product ids.
     products = st.session_state.get("inventory_products", [])
     product_ids = [item["product_id"] for item in products]
     if not product_ids:
@@ -41,6 +43,7 @@ def clear_market_result_if_matches(product_id: str) -> None:
 
 
 def refresh_market_cache_snapshot(limit: int = 200) -> None:
+    # The settings tab reads cache metadata from the backend so the UI never guesses cache state locally.
     result = get_json(f"{MARKET_INTELLIGENCE_BASE_URL}/api/v1/cache/market?limit={limit}", timeout=30.0)
     st.session_state["market_cache_snapshot"] = result["data"] if result["ok"] else None
     st.session_state["market_cache_error"] = None if result["ok"] else result["error"]
@@ -188,6 +191,7 @@ def render_compact_concierge_result(result: dict) -> None:
 def render_compact_market_result(result: dict) -> None:
     st.success(f"Market analysis ready for {result.get('product_name', 'product')}")
     cache = result.get("cache", {})
+    # This top summary is meant to answer the first demo question immediately: live result or cache hit?
     top = st.columns(4)
     top[0].metric("Current Price", result.get("current_unit_price", "-"))
     top[1].metric("Recommended", result.get("recommended_price", "-"))
@@ -258,6 +262,7 @@ def render_compact_market_result(result: dict) -> None:
 
 
 def render_market_cache_snapshot(snapshot: dict) -> None:
+    # The settings view is intentionally tabular so cache age and expiry are easy to compare in demos.
     st.markdown("**Market Cache Overview**")
     top = st.columns(4)
     top[0].metric("Cache Enabled", snapshot.get("cache_enabled", "-"))
